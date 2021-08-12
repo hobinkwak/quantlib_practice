@@ -28,6 +28,29 @@ def GET_QUOTE(today):
     
     return curve
 
+def GET_QUOTE(today, ticker):
+    xw.App(visible=False)
+    wb = xw.Book('./data/FX_CURVE.xlsx')
+    
+    if ticker =='USD':   
+        sht = wb.sheets('USDIRS')
+        curve = sht.range('A1:D25').options(pd.DataFrame).value
+    elif ticker == 'KRW':
+        sht = wb.sheets('KRWCCS')
+        curve = sht.range('A1:D15').options(pd.DataFrame).value
+    wb.close()
+    
+    #잔존일수 칼럼 추가
+    curve['DaysToMaturity'] = np.nan
+    #to_datetime : dtype을 datetime[ns]로 바꾸기
+    # .dt.date : 아예 datetime(y,m,d) 식으로 바꾸기
+    curve['Maturity'] = pd.to_datetime(curve['Maturity']).dt.date
+    
+    for tenor in curve.index:
+        curve.loc[tenor, 'DaysToMaturity'] = (curve.loc[tenor, 'Maturity'] - today).days
+    
+    return curve
+
 #quote는 dataframe 형태
 def SWAP_CURVE(today, quote):
     # 금리 기간구조를 만들때, 여러 helper를 이용해야 함
@@ -93,6 +116,109 @@ def SWAP_CURVE(today, quote):
     return depoFuturesSwapCurve #여기까지만 있어도 파생상품 Pricing은 가능
     #금리커브가 필요한 이유는 할인커브를 만들기 위함임!
 
+#미국 스왑금리 커브
+def USDIRS_CURVE(today, quote):
+    # 금리 기간구조를 만들때, 여러 helper를 이용해야 함
+    # 단기준거금리 / 선물내재금리 / 스왑금리
+    # CASH , FUTURE, SWAP 나누기
+    depo = quote[quote['InstType'] == 'CASH']  #단기금리
+    futures = quote[quote['InstType'] == 'FUTURE'] #중기금리
+    swap = quote[quote['InstType'] == 'SWAP'] #장기금리
+
+    #전역으로 먼저 평가일자 선언
+    todays_date = qe.Date(today.day, today.month, today.year)
+    qe.Settings.instance().evaluationDate = todays_date
+    
+    #Convention
+    calendar = qe.UnitedStates()
+    dayCounter = qe.Actual360() #1년을 360일로
+    convention = ql.ModifiedFollowing
+    settlementDays = 2  #정산일자 / 스왑계약, 거래일로부터 2일 뒤 효력
+    # 한국은 보통 1일
+    frequency = ql.Semiannual
+    
+    #Deposit rate helper
+    depositHelpers = [qe.DepositRateHelper(ql.QuoteHandle(ql.SimpleQuote(rate / 100)),
+                                         ql.Period(int(day), ql.Days),
+                                         settlementDays,
+                                         calendar,
+                                         convention,
+                                         False,
+                                         dayCounter)
+                    for day,rate in zip(depo['DaysToMaturity'], depo['Market.Mid'])]
+    
+    #Futures Rate helper
+    futuresHelpers = []
+    for i, price in enumerate(futures['Market.Mid']):
+        iborStartDate = ql.Date(futures['Maturity'][i].day,
+                               futures['Maturity'][i].month,
+                               futures['Maturity'][i].year)
+        futuresHelper = ql.FuturesRateHelper(price,
+                                            iborStartDate, #각 선물의 만기
+                                            3,
+                                            calendar,
+                                            convention,
+                                            False,
+                                            dayCounter)
+        futuresHelpers.append(futuresHelper)
+    
+    #Swap Rate Helper
+    swapHelpers = [ql.SwapRateHelper(ql.QuoteHandle(ql.SimpleQuote(rate / 100)),
+                                    ql.Period(int(day), ql.Days), #잔존일수
+                                    calendar,
+                                    frequency, convention, dayCounter,
+                                    ql.USDLibor(ql.Period(3, ql.Months))) #준거금리... 껍데기인 유라이보 3개월.
+                                   #아무거나 3개월짜리 지정..
+                  for day, rate in zip(swap['DaysToMaturity'], swap['Market.Mid'])]
+    
+    
+    helpers = depositHelpers + futuresHelpers + swapHelpers
+    depoFuturesSwapCurve = ql.PiecewiseLinearZero(todays_date, helpers, dayCounter)
+    
+    return depoFuturesSwapCurve #여기까지만 있어도 파생상품 Pricing은 가능
+    #금리커브가 필요한 이유는 할인커브를 만들기 위함임!
+    
+
+def KRWCCS_CURVE(today, quote):
+    depo = quote[quote['InstType'] == 'CASH']  
+    swap = quote[quote['InstType'] == 'SWAP'] 
+    
+    todays_date = qe.Date(today.day, today.month, today.year)
+    qe.Settings.instance().evaluationDate = todays_date   
+    
+    calendar = qe.SouthKorea()
+    dayCounter = qe.Actual365Fixed() #Act/365 : 1년은 365일로 가정
+    #이자계산은 실제 일수대로 하고 분모인 1년을 365로 하겟다.
+    convention = ql.ModifiedFollowing
+    settlementDays = 1
+    # 금리결정일과 이자정산일의 차이
+    # 거래일과 효력발생일의 차이 
+    frequency = ql.Semiannual
+    
+    #Deposit rate helper
+    depositHelpers = [qe.DepositRateHelper(ql.QuoteHandle(ql.SimpleQuote(rate / 100)),
+                                         ql.Period(int(day), ql.Days),
+                                         settlementDays,
+                                         calendar,
+                                         convention,
+                                         False,
+                                         dayCounter)
+                    for day,rate in zip(depo['DaysToMaturity'], depo['Market.Mid'])]
+    
+    #Swap Rate Helper
+    swapHelpers = [ql.SwapRateHelper(ql.QuoteHandle(ql.SimpleQuote(rate / 100)),
+                                    ql.Period(int(day), ql.Days), #잔존일수
+                                    calendar,
+                                    frequency, convention, dayCounter,
+                                    ql.USDLibor(ql.Period(3, ql.Months))) #준거금리
+                  for day, rate in zip(swap['DaysToMaturity'], swap['Market.Mid'])]
+    
+    helpers = depositHelpers + swapHelpers
+    depoFuturesSwapCurve = ql.PiecewiseLinearZero(todays_date, helpers, dayCounter)
+    
+    return depoFuturesSwapCurve    
+    
+    
 # 커브에 담긴 모든 만기의 데이터 중에서
 #특정시점에서의 할인계수, 제로금리, 선도금리 계산
 def DISCOUNT_FACTOR(date, curve):
